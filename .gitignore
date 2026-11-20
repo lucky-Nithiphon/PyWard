@@ -1,0 +1,15 @@
+@"
+# Python cache & build files
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment & testing
+.venv/
+.pytest_cache/
+
+# Runtime security logs
+*.jsonl
+"@ | Out-File -FilePath .gitignore -Encoding utf8
