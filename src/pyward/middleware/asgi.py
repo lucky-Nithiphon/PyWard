@@ -1,26 +1,44 @@
 import json
 import time
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
 from pyward.config import WardConfig, WardMode
+from pyward.core.parser import RequestParser
+from pyward.guards.base import BaseGuard, GuardFinding, InspectionContext
+from pyward.guards.injection import InjectionGuard
 from pyward.telemetry.logger import SecurityEvent, SecurityLogger
 
-ASGIApp = Callable[[dict[str, Any], Callable[[], Awaitable[dict[str, Any]]], Callable[[dict[str, Any]], Awaitable[None]]], Awaitable[None]]
+ASGIApp = Callable[
+    [
+        dict[str, Any],
+        Callable[[], Awaitable[dict[str, Any]]],
+        Callable[[dict[str, Any]], Awaitable[None]],
+    ],
+    Awaitable[None],
+]
 
 
 class PyWardMiddleware:
     """
     Pure ASGI Security Middleware สำหรับ FastAPI / Starlette
-    ทำหน้าที่ดักจับ Request/Response Stream, ตรวจสอบบริบทเชิงลึก และบังคับใช้นโยบายความปลอดภัย
+    ดักจับ Request Stream, แกะโครงสร้าง JSON/Query, ส่งตรวจผ่านขบวน Guard และบันทึก SIEM Log
     """
 
-    def __init__(self, app: ASGIApp, config: WardConfig | None = None) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        config: WardConfig | None = None,
+        guards: list[BaseGuard] | None = None,
+    ) -> None:
         self.app = app
         self.config = config or WardConfig()
         self.logger = SecurityLogger(
             log_file=self.config.log_file,
             console_log=self.config.console_log,
         )
+        # ตัวแกะข้อมูล (v0.2.0) และขบวน Guard ตรวจจับภัยคุกคาม (v0.3.0)
+        self.parser = RequestParser()
+        self.guards: list[BaseGuard] = guards if guards is not None else [InjectionGuard()]
 
     async def __call__(
         self,
@@ -28,38 +46,43 @@ class PyWardMiddleware:
         receive: Callable[[], Awaitable[dict[str, Any]]],
         send: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        # ทำงานเฉพาะ HTTP Request (ข้าม WebSocket หรือ Lifespan events)
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
         path: str = scope.get("path", "/")
 
-        # 1. ตรวจสอบ Path Whitelist
+        # 1. ตรวจสอบ Path Whitelist (เช่น /docs, /health)
         if self._is_path_excluded(path):
             await self.app(scope, receive, send)
             return
 
         start_time = time.perf_counter()
 
-        # 2. อ่าน Request Body อย่างปลอดภัยและเตรียม Stream Replay ให้ FastAPI ใช้งานต่อ
+        # 2. อ่าน Request Body อย่างปลอดภัยและเตรียม Stream Replay คืนให้ FastAPI
         body_bytes, replay_receive = await self._buffer_request_body(receive)
 
-        # 3. ดึงข้อมูลพื้นฐานของ Request
+        # 3. ดึงข้อมูลบริบทพื้นฐานจาก ASGI Scope
         method: str = scope.get("method", "GET")
         client_info = scope.get("client")
         client_ip: str = client_info[0] if client_info else "unknown"
         query_string: str = scope.get("query_string", b"").decode("utf-8", errors="replace")
+        headers: dict[str, str] = {
+            k.decode("latin-1").lower(): v.decode("latin-1")
+            for k, v in scope.get("headers", [])
+        }
 
-        # 4. จุดเชื่อมต่อ Inspection Pipeline (จะเติม Guards ในเฟสที่ 2 และ 3)
+        # 4. ส่งข้อมูลเข้าสู่ Inspection Pipeline (Parser -> Guards)
         finding = self._run_inspection_pipeline(
             method=method,
             path=path,
+            client_ip=client_ip,
             query_string=query_string,
             body_bytes=body_bytes,
-            scope=scope,
+            headers=headers,
         )
 
+        # 5. ตัดสินใจเมื่อตรวจพบการโจมตี (บันทึก Log + บล็อกหรือปล่อยผ่านตามโหมด)
         if finding is not None:
             latency_us = int((time.perf_counter() - start_time) * 1_000_000)
             is_blocking = self.config.mode == WardMode.BLOCK_MODE
@@ -70,14 +93,14 @@ class PyWardMiddleware:
                 client_ip=client_ip,
                 method=method,
                 path=path,
-                inspection_vector=finding["vector"],
-                attack_type=finding["attack_type"],
-                rule_id=finding["rule_id"],
+                inspection_vector=finding.vector,
+                attack_type=finding.attack_type,
+                rule_id=finding.rule_id,
                 action=action,
                 status_code=status_code,
                 latency_us=latency_us,
-                json_path=finding.get("json_path"),
-                detail=finding.get("detail"),
+                json_path=finding.json_path,
+                detail=finding.detail,
             )
             self.logger.log_event(event)
 
@@ -85,16 +108,18 @@ class PyWardMiddleware:
                 await self._send_block_response(send, event.event_id)
                 return
 
-        # 5. ส่งต่อ Request ที่ปลอดภัย (พร้อม Body Stream เดิม) ไปยัง FastAPI Endpoint
+        # 6. ส่งต่อ Request ที่ปลอดภัย (พร้อม Body Stream เดิม) ไปยัง FastAPI Endpoint
         await self.app(scope, replay_receive, send)
 
     def _is_path_excluded(self, path: str) -> bool:
-        return any(path == excluded or path.startswith(excluded.rstrip("/") + "/") for excluded in self.config.excluded_paths)
+        return any(
+            path == excluded or path.startswith(excluded.rstrip("/") + "/")
+            for excluded in self.config.excluded_paths
+        )
 
     async def _buffer_request_body(
         self, receive: Callable[[], Awaitable[dict[str, Any]]]
     ) -> tuple[bytes, Callable[[], Awaitable[dict[str, Any]]]]:
-        """อ่าน Body ทั้งหมดเก็บไว้ใน Memory และสร้างฟังก์ชัน receive ใหม่เพื่อคืนค่าให้ Endpoint"""
         chunks: list[bytes] = []
         more_body = True
 
@@ -122,11 +147,27 @@ class PyWardMiddleware:
         self,
         method: str,
         path: str,
+        client_ip: str,
         query_string: str,
         body_bytes: bytes,
-        scope: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """Placeholder สำหรับเชื่อมต่อ Normalizer และ Guards ในเฟส 2 และ 3"""
+        headers: dict[str, str],
+    ) -> GuardFinding | None:
+        """แกะโครงสร้าง Request แล้วส่งต่อให้ Guard ทุกตัวในขบวนตรวจสอบตามลำดับ"""
+        fields = self.parser.parse_request(query_string, body_bytes)
+
+        context = InspectionContext(
+            method=method,
+            path=path,
+            client_ip=client_ip,
+            fields=fields,
+            headers=headers,
+        )
+
+        for guard in self.guards:
+            finding = guard.inspect(context, self.config)
+            if finding is not None:
+                return finding
+
         return None
 
     async def _send_block_response(

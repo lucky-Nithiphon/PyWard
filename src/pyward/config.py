@@ -14,6 +14,7 @@ class WardConfig:
     mode: WardMode = WardMode.BLOCK_MODE
     log_file: str | None = "pyward_security.jsonl"
     console_log: bool = True
+    console_format: str = "pretty"  # เลือกได้ระหว่าง "pretty" (คนอ่านง่าย) หรือ "json" (สำหรับ Cloud/Docker)
 
     # ระบบ Whitelist / Exclusions เพื่อลด False Positive
     excluded_paths: list[str] = field(default_factory=lambda: ["/docs", "/openapi.json", "/health"])
