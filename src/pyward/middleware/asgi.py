@@ -1,3 +1,4 @@
+import base64
 import json
 import time
 from typing import Any, Awaitable, Callable
@@ -5,7 +6,10 @@ from typing import Any, Awaitable, Callable
 from pyward.config import WardConfig, WardMode
 from pyward.core.parser import RequestParser
 from pyward.guards.base import BaseGuard, GuardFinding, InspectionContext
+from pyward.guards.idor import IdorGuard
 from pyward.guards.injection import InjectionGuard
+from pyward.guards.mass_assignment import MassAssignmentGuard
+from pyward.guards.response_dlp import ResponseDlpGuard
 from pyward.telemetry.logger import SecurityEvent, SecurityLogger
 
 ASGIApp = Callable[
@@ -21,7 +25,8 @@ ASGIApp = Callable[
 class PyWardMiddleware:
     """
     Pure ASGI Security Middleware สำหรับ FastAPI / Starlette
-    ดักจับ Request Stream, แกะโครงสร้าง JSON/Query, ส่งตรวจผ่านขบวน Guard และบันทึก SIEM Log
+    ครบวงจรทั้งขาเข้า (Ingress: Injection, Mass Assignment, IDOR)
+    และขาออก (Egress: Response DLP ป้องกันข้อมูลลับและ Stack Trace รั่วไหล)
     """
 
     def __init__(
@@ -29,16 +34,30 @@ class PyWardMiddleware:
         app: ASGIApp,
         config: WardConfig | None = None,
         guards: list[BaseGuard] | None = None,
+        response_dlp: ResponseDlpGuard | None = None,
     ) -> None:
         self.app = app
         self.config = config or WardConfig()
         self.logger = SecurityLogger(
             log_file=self.config.log_file,
             console_log=self.config.console_log,
+            console_format=self.config.console_format,
         )
-        # ตัวแกะข้อมูล (v0.2.0) และขบวน Guard ตรวจจับภัยคุกคาม (v0.3.0)
         self.parser = RequestParser()
-        self.guards: list[BaseGuard] = guards if guards is not None else [InjectionGuard()]
+
+        # ขบวน Guard ขาเข้า (ทำงานเรียงตามลำดับ: Injection -> Mass Assignment -> IDOR)
+        self.guards: list[BaseGuard] = (
+            guards
+            if guards is not None
+            else [
+                InjectionGuard(),
+                MassAssignmentGuard(),
+                IdorGuard(),
+            ]
+        )
+
+        # ด่านตรวจขาออก (Egress Data Loss Prevention)
+        self.response_dlp = response_dlp if response_dlp is not None else ResponseDlpGuard()
 
     async def __call__(
         self,
@@ -62,7 +81,7 @@ class PyWardMiddleware:
         # 2. อ่าน Request Body อย่างปลอดภัยและเตรียม Stream Replay คืนให้ FastAPI
         body_bytes, replay_receive = await self._buffer_request_body(receive)
 
-        # 3. ดึงข้อมูลบริบทพื้นฐานจาก ASGI Scope
+        # 3. ดึงข้อมูลบริบทและตัวตนผู้ใช้ (Headers + JWT/X-User-ID)
         method: str = scope.get("method", "GET")
         client_info = scope.get("client")
         client_ip: str = client_info[0] if client_info else "unknown"
@@ -71,8 +90,9 @@ class PyWardMiddleware:
             k.decode("latin-1").lower(): v.decode("latin-1")
             for k, v in scope.get("headers", [])
         }
+        user_id = self._extract_user_id(headers)
 
-        # 4. ส่งข้อมูลเข้าสู่ Inspection Pipeline (Parser -> Guards)
+        # 4. ตรวจสอบขาเข้า (Ingress Pipeline: Parser -> Injection / Mass Assignment / IDOR)
         finding = self._run_inspection_pipeline(
             method=method,
             path=path,
@@ -80,9 +100,9 @@ class PyWardMiddleware:
             query_string=query_string,
             body_bytes=body_bytes,
             headers=headers,
+            user_id=user_id,
         )
 
-        # 5. ตัดสินใจเมื่อตรวจพบการโจมตี (บันทึก Log + บล็อกหรือปล่อยผ่านตามโหมด)
         if finding is not None:
             latency_us = int((time.perf_counter() - start_time) * 1_000_000)
             is_blocking = self.config.mode == WardMode.BLOCK_MODE
@@ -99,6 +119,7 @@ class PyWardMiddleware:
                 action=action,
                 status_code=status_code,
                 latency_us=latency_us,
+                user_id=user_id,
                 json_path=finding.json_path,
                 detail=finding.detail,
             )
@@ -108,14 +129,103 @@ class PyWardMiddleware:
                 await self._send_block_response(send, event.event_id)
                 return
 
-        # 6. ส่งต่อ Request ที่ปลอดภัย (พร้อม Body Stream เดิม) ไปยัง FastAPI Endpoint
-        await self.app(scope, replay_receive, send)
+        # 5. ห่อหุ้มท่อขาออก (Egress Wrapper) เพื่อตรวจสอบ Response DLP ก่อนส่งกลับให้ผู้ใช้
+        response_start: dict[str, Any] | None = None
+        response_chunks: list[bytes] = []
+
+        async def intercept_send(message: dict[str, Any]) -> None:
+            nonlocal response_start
+
+            if message["type"] == "http.response.start":
+                response_start = message
+                return
+
+            if message["type"] == "http.response.body":
+                response_chunks.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+
+                full_res_body = b"".join(response_chunks)
+                content_type = self._get_response_content_type(response_start)
+
+                dlp_finding = self.response_dlp.inspect_response(full_res_body, content_type)
+                if dlp_finding is not None:
+                    latency_us = int((time.perf_counter() - start_time) * 1_000_000)
+                    is_blocking = self.config.mode == WardMode.BLOCK_MODE
+                    action = "BLOCKED" if is_blocking else "MONITORED"
+                    orig_status = response_start.get("status", 200) if response_start else 200
+                    logged_status = 500 if is_blocking else orig_status
+
+                    event = SecurityEvent(
+                        client_ip=client_ip,
+                        method=method,
+                        path=path,
+                        inspection_vector=dlp_finding.vector,
+                        attack_type=dlp_finding.attack_type,
+                        rule_id=dlp_finding.rule_id,
+                        action=action,
+                        status_code=logged_status,
+                        latency_us=latency_us,
+                        user_id=user_id,
+                        json_path=dlp_finding.json_path,
+                        detail=dlp_finding.detail,
+                    )
+                    self.logger.log_event(event)
+
+                    if is_blocking:
+                        await self._send_dlp_block_response(send, event.event_id)
+                        return
+
+                # Response ปลอดภัย (หรืออยู่ใน MONITOR_MODE) -> ปล่อยส่งออกตามปกติ
+                if response_start is not None:
+                    await send(response_start)
+                await send({"type": "http.response.body", "body": full_res_body, "more_body": False})
+                return
+
+            await send(message)
+
+        # 6. ส่งต่อ Request ที่ปลอดภัยไปยัง FastAPI Endpoint โดยดักรับขาออกผ่าน intercept_send
+        await self.app(scope, replay_receive, intercept_send)
 
     def _is_path_excluded(self, path: str) -> bool:
         return any(
             path == excluded or path.startswith(excluded.rstrip("/") + "/")
             for excluded in self.config.excluded_paths
         )
+
+    def _extract_user_id(self, headers: dict[str, str]) -> str | None:
+        """
+        ดึงตัวตนผู้ใช้งาน (user_id) จาก Request Headers:
+        1. ลองแกะ JWT Payload (Authorization: Bearer <token>) หาฟิลด์ 'sub' หรือ 'user_id'
+        2. หากไม่มี JWT ให้ fallback ไปอ่านจาก Header 'X-User-ID'
+        """
+        auth_header = headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            parts = token.split(".")
+            if len(parts) == 3:
+                try:
+                    # เติม padding '=' ให้ครบตามมาตรฐาน Base64URL ก่อนถอดรหัส
+                    payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+                    payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+                    uid = payload.get("sub") or payload.get("user_id")
+                    if uid is not None:
+                        return str(uid).strip()
+                except Exception:
+                    pass
+
+        if "x-user-id" in headers:
+            return headers["x-user-id"].strip() or None
+
+        return None
+
+    def _get_response_content_type(self, response_start: dict[str, Any] | None) -> str:
+        if not response_start:
+            return ""
+        for k, v in response_start.get("headers", []):
+            if k.decode("latin-1").lower() == "content-type":
+                return v.decode("latin-1")
+        return ""
 
     async def _buffer_request_body(
         self, receive: Callable[[], Awaitable[dict[str, Any]]]
@@ -151,8 +261,8 @@ class PyWardMiddleware:
         query_string: str,
         body_bytes: bytes,
         headers: dict[str, str],
+        user_id: str | None,
     ) -> GuardFinding | None:
-        """แกะโครงสร้าง Request แล้วส่งต่อให้ Guard ทุกตัวในขบวนตรวจสอบตามลำดับ"""
         fields = self.parser.parse_request(query_string, body_bytes)
 
         context = InspectionContext(
@@ -161,6 +271,7 @@ class PyWardMiddleware:
             client_ip=client_ip,
             fields=fields,
             headers=headers,
+            user_id=user_id,
         )
 
         for guard in self.guards:
@@ -185,6 +296,31 @@ class PyWardMiddleware:
             {
                 "type": "http.response.start",
                 "status": self.config.block_status_code,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode("ascii")),
+                    (b"x-protected-by", b"PyWard-RASP"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
+
+    async def _send_dlp_block_response(
+        self, send: Callable[[dict[str, Any]], Awaitable[None]], event_id: str
+    ) -> None:
+        """ตอบกลับข้อความ Error กลางที่ปลอดภัยแทน Response ที่มีข้อมูลลับรั่วไหล"""
+        payload = json.dumps(
+            {
+                "error": "Internal Server Error",
+                "message": "Response redacted by PyWard RASP to prevent sensitive data exposure.",
+                "incident_id": event_id,
+            }
+        ).encode("utf-8")
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 500,
                 "headers": [
                     (b"content-type", b"application/json"),
                     (b"content-length", str(len(payload)).encode("ascii")),
