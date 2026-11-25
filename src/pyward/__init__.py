@@ -1,6 +1,6 @@
 """PyWard - Context-Aware Runtime Application Self-Protection (RASP) for FastAPI & Starlette."""
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 from pyward.config import WardConfig, WardMode
 from pyward.middleware.asgi import PyWardMiddleware
